@@ -18,7 +18,11 @@ def activatize(name: str) -> nn.Module:
     """
     Get activation module.
     """
-    if name == "softplus":
+    if name == "relu":
+        return nn.ReLU(inplace=True)
+    elif name == "gelu":
+        return nn.GELU()
+    elif name == "softplus":
         return nn.Softplus()
     elif name == "sigmoid":
         return nn.Sigmoid()
@@ -248,10 +252,13 @@ class GNNx2(nn.Module):
             activate=activate,
         )
 
+        self.bn1 = nn.BatchNorm1d(embed_inside_size)
+        self.bn2 = nn.BatchNorm1d(feat_target_size)
+
         # Edge transform (for scalar weights in GCN/Cheb)
         if feat_input_size_edge > 1 and convolve in ("gcn", "gcnub", "cheb"):
             self.edge_transform = nn.Linear(feat_input_size_edge, 1)
-            self.edge_activate = activatize("softplus")
+            self.edge_activate = activatize("relu")
         else:
             self.edge_transform = nn.Identity()
             self.edge_activate = activatize("identity")
@@ -326,11 +333,15 @@ class GNNx2(nn.Module):
             # GCN/Cheb use scalar edge weights
             edge_weight = edge_feats.squeeze(-1)
             x = self.gnn1(node_feats, edge_index, edge_weight=edge_weight)
-            x = self.gnn2(self.activate(x), edge_index, edge_weight=edge_weight)
+            x = self.activate(self.bn1(x))
+            x = self.gnn2(x, edge_index, edge_weight=edge_weight)
+            x = self.bn2(x)
         else:
             # GAT / GINE use edge_attr
             x = self.gnn1(node_feats, edge_index, edge_feats.squeeze())
-            x = self.gnn2(self.activate(x), edge_index, edge_feats.squeeze())
+            x = self.activate(self.bn1(x))
+            x = self.gnn2(x, edge_index, edge_feats.squeeze())
+            x = self.bn2(x)
         return x
 
     def forward(
@@ -560,19 +571,27 @@ class GRU_GCN_classification(nn.Module):
         self.num_classes = num_classes
         self.device = device
 
+        embed_dim = getattr(args, "embed_dim", args.input_dim)
+        skip = getattr(args, "skip", True)
+        activate = getattr(args, "activate", "relu")
+        num_rnn_layers = getattr(args, "num_rnn_layers", 1)
+
         self.gru_gcn = GRU_GCN(
             feat_input_size_edge=args.input_dim,
             feat_input_size_node=args.input_dim,
             feat_target_size=args.rnn_units,
-            embed_inside_size=args.input_dim,
+            embed_inside_size=embed_dim,
             convolve=gnn,
             reduce_edge="gru",
             reduce_node="gru",
-            skip=False,
-            activate="tanh",
+            skip=skip,
+            activate=activate,
             concat=True,
             neo_gnn=True,
         )
+        if num_rnn_layers > 1:
+            self.gru_gcn.snn_node = nn.GRU(args.input_dim, embed_dim, num_layers=num_rnn_layers, dropout=args.dropout)
+            self.gru_gcn.snn_edge = nn.GRU(1, embed_dim, num_layers=num_rnn_layers, dropout=args.dropout)
 
         if args.agg != "concat":
             self.fc = nn.Linear(self.gru_gcn.feat_target_size, num_classes)
