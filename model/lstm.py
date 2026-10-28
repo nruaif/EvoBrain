@@ -335,11 +335,12 @@ class LSTMModel(nn.Module):
         self.relu = nn.ReLU()
         self.softmax = MulDivFreeSoftmax(dim=-1)
 
-    def forward(self, inputs, seq_lengths):
+    def forward(self, inputs, seq_lengths, return_sequence=False):
         """
         Args:
             inputs: (batch_size, max_seq_len, num_nodes, input_dim)
             seq_lengths: (batch_size, )
+            return_sequence: if True, returns (B, T, num_classes) and (B, T, hidden_dim) for dense temporal supervision.
         """
         batch_size, max_seq_len, _, _ = inputs.shape
         inputs = torch.reshape(inputs, (batch_size, max_seq_len, -1))
@@ -347,6 +348,13 @@ class LSTMModel(nn.Module):
         initial_hidden_state, initial_cell_state = self.init_hidden(batch_size)
 
         output, _ = self.lstm(inputs, (initial_hidden_state, initial_cell_state))
+
+        if return_sequence:
+            if self._device is not None:
+                output = output.to(self._device)
+            normed = self.out_norm(output)
+            logits = self.fc(self.relu(self.dropout(normed)))
+            return logits, output
 
         last_out = utils.last_relevant_pytorch(output, seq_lengths, batch_first=True)
         if self._device is not None:
