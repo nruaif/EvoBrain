@@ -1,8 +1,18 @@
 """
-Hardware-Efficient Layer-Normalized LSTM with Guaranteed Normalization for Edge Devices
-Implements the algorithms from:
-  "Hardware-Efficient Softmax and Layer Normalization with Guaranteed Normalization for Edge Devices"
-  Dawon Choi, Hana Kim, Ji-Hoon Kim (Hanyang University, arXiv:2604.23647v1 [cs.AR] 26 Apr 2026)
+Hardware-Efficient Layer-Normalized LSTM with Guaranteed Normalization for Edge FPGAs.
+Unites the algorithms and hardware architectures from two recent breakthroughs:
+1. "Hardware-Efficient Softmax and Layer Normalization with Guaranteed Normalization for Edge Devices"
+   Dawon Choi, Hana Kim, Ji-Hoon Kim (Hanyang University, arXiv:2604.23647v1 [cs.AR], 26 Apr 2026)
+   - CoRN-LN: 14x smaller (1199 um^2), 2-cycle Newton rsqrt, guaranteed unit-variance sigma = 1.0.
+   - Mul-/Div-free Softmax: 11x smaller (942 um^2), Radix R=8 2-LUT exp, guaranteed sum(p) == 1.0.
+
+2. "Energy Efficient LSTM Accelerators for Embedded FPGAs through Parameterised Architecture Design"
+   Chao Qian, Tianheng Ling, Gregor Schiele (University of Duisburg-Essen, arXiv:2604.19293v1 [cs.AR], 21 Apr 2026)
+   - HardSigmoid*: Slope 0.125 = 1/8 = 2^(-3) enables pure 3-bit arithmetic right shift ((x >> 3) + 0.5).
+     Consumes only 3 LUTs and 0 DSPs (vs 256-entry tables or float exp).
+   - HardTanh: Clamped linear interval [-1.0, 1.0], consuming only 5 LUTs and 0 DSPs.
+   - 8-bit Fixed-Point (4,8) QAT: Replaces DSP multipliers with fast LUT-based multipliers, reaching 204 MHz.
+   - 5-stage pipelined MAC loop: Reduces latency by 51% and power by 18.57% on Spartan-7 XC7S15.
 """
 
 import math
@@ -12,10 +22,74 @@ import torch.nn.functional as F
 import utils
 
 
+# ---------------------------------------------------------------------------
+# Paper 2 (Qian et al. 2026): Zero-DSP Activation Functions & Fixed-Point QAT
+# ---------------------------------------------------------------------------
+
+class HardSigmoidStar(nn.Module):
+    """
+    HardSigmoid* from Qian et al. (arXiv:2604.19293v1).
+    Uses a hardware-friendly slope of 0.125 = 1/8 = 2^(-3) for (4,8) fixed-point data.
+    On FPGA:
+        HardSigmoid*(x) = clamp((x >> 3) + 0.5, 0.0, 1.0)
+    Implemented in hardware with 0 DSPs and only 3 LUTs (vs 256-entry LUTs in prior work).
+    """
+    def __init__(self, slope=0.125, offset=0.5):
+        super().__init__()
+        self.slope = slope
+        self.offset = offset
+
+    def forward(self, x):
+        return torch.clamp(x * self.slope + self.offset, 0.0, 1.0)
+
+
+class HardTanh_FPGA(nn.Module):
+    """
+    HardTanh from Qian et al. (arXiv:2604.19293v1).
+    Piecewise-linear approximation to Tanh:
+        HardTanh(x) = clamp(x, min_val=-1.0, max_val=1.0)
+    Consumes only 2 fixed-point comparators (5 LUTs) and 0 DSPs on Spartan-7.
+    """
+    def __init__(self, min_val=-1.0, max_val=1.0):
+        super().__init__()
+        self.min_val = min_val
+        self.max_val = max_val
+
+    def forward(self, x):
+        return torch.clamp(x, self.min_val, self.max_val)
+
+
+class FixedPointQuantizerSTE(torch.autograd.Function):
+    """
+    Straight-Through Estimator (STE) for (4,8) Fixed-Point Quantization (Qian et al. Sec 4.1).
+    Total width: 8 bits, Fractional bits: 4.
+    Range: [-8.0, 7.9375] in steps of 0.0625 (1/16).
+    """
+    @staticmethod
+    def forward(ctx, x, frac_bits=4, total_bits=8):
+        scale = 2.0 ** frac_bits
+        min_val = - (2.0 ** (total_bits - frac_bits - 1))
+        max_val = (2.0 ** (total_bits - frac_bits - 1)) - (1.0 / scale)
+        x_q = torch.clamp(torch.round(x * scale) / scale, min_val, max_val)
+        return x_q
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None, None
+
+
+def quantize_q44(x):
+    return FixedPointQuantizerSTE.apply(x, 4, 8)
+
+
+# ---------------------------------------------------------------------------
+# Paper 1 (Choi et al. 2026): CoRN-LN LayerNorm & Mul-/Div-Free Softmax
+# ---------------------------------------------------------------------------
+
 class CoRNLayerNorm(nn.Module):
     """
     Algorithm 2 & Ref [12]: Compressed Reciprocal Newton Layer Normalization (CoRN-LN).
-    - Eliminates expensive hardware square-root and division units (14x smaller area: 1199 um^2).
+    - Eliminates expensive hardware square-root and division units (14x smaller: 1199 um^2).
     - Uses Leading-One-Detector (LOD) for initial estimate + 2-cycle Reciprocal Newton iteration:
         x_{i+1} = 0.5 * [x_i + 1 / (x_i * var)]
     - Guarantees unit variance (|1 - sigma| < 0.2e-6) for score-oriented edge tasks.
@@ -93,45 +167,75 @@ class MulDivFreeSoftmax(nn.Module):
         return p
 
 
+# ---------------------------------------------------------------------------
+# Unified Hardware-Efficient LSTM Architecture
+# ---------------------------------------------------------------------------
+
 class CoRN_LSTMCell(nn.Module):
     """
-    Hardware-Efficient Layer-Normalized LSTM Cell (Ba et al. + Choi et al. 2026).
-    Applies CoRN-LN (Reciprocal Newton LayerNorm) to gate activations and cell state,
-    eliminating division/square-root silicon while preventing covariate shift on edge devices.
+    Hardware-Efficient Recurrent Cell combining:
+    - Qian et al. (2026): HardSigmoid* (slope 0.125 = 1/8) + HardTanh (clamp [-1, 1]) -> Zero DSPs, 8 LUTs!
+    - Choi et al. (2026): CoRN-LN on gate projections and cell state -> 14x smaller, unit variance sigma=1.0.
+    - Optional Q4.4 Fixed-Point Quantization-Aware Training (QAT).
     """
-    def __init__(self, input_size, hidden_size):
+    def __init__(self, input_size, hidden_size, act_mode="hard", use_norm=True, quantize=False):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
+        self.act_mode = act_mode
+        self.use_norm = use_norm
+        self.quantize = quantize
 
         self.weight_ih = nn.Linear(input_size, 4 * hidden_size, bias=False)
         self.weight_hh = nn.Linear(hidden_size, 4 * hidden_size, bias=False)
 
-        # CoRN-LN on concatenated gates [f, i, c_tilde, o]
-        self.ln_gates = CoRNLayerNorm(4 * hidden_size)
-        # CoRN-LN on candidate cell state
-        self.ln_c = CoRNLayerNorm(hidden_size)
+        if use_norm:
+            self.ln_gates = CoRNLayerNorm(4 * hidden_size)
+            self.ln_c = CoRNLayerNorm(hidden_size)
+        else:
+            self.ln_gates = nn.Identity()
+            self.ln_c = nn.Identity()
+
+        if act_mode == "hard":
+            self.sig = HardSigmoidStar(slope=0.125, offset=0.5)
+            self.tanh = HardTanh_FPGA(min_val=-1.0, max_val=1.0)
+        else:
+            self.sig = nn.Sigmoid()
+            self.tanh = nn.Tanh()
 
     def forward(self, x, state):
         h_prev, c_prev = state
-        gates = self.ln_gates(self.weight_ih(x) + self.weight_hh(h_prev))
+        
+        ih = self.weight_ih(x)
+        hh = self.weight_hh(h_prev)
+        if self.quantize:
+            ih = quantize_q44(ih)
+            hh = quantize_q44(hh)
+
+        gates = self.ln_gates(ih + hh)
         f_gate, i_gate, c_tilde, o_gate = gates.chunk(4, dim=-1)
 
-        f = torch.sigmoid(f_gate)
-        i = torch.sigmoid(i_gate)
-        c_cand = torch.tanh(c_tilde)
+        f = self.sig(f_gate)
+        i = self.sig(i_gate)
+        c_cand = self.tanh(c_tilde)
 
         c = f * c_prev + i * c_cand
-        h = torch.sigmoid(o_gate) * torch.tanh(self.ln_c(c))
+        c_normed = self.ln_c(c)
+        h = self.sig(o_gate) * self.tanh(c_normed)
+
+        if self.quantize:
+            c = quantize_q44(c)
+            h = quantize_q44(h)
+
         return h, c
 
 
 class HardwareEfficientLSTM(nn.Module):
     """
-    Multi-layer Hardware-Efficient LSTM using CoRN-LN cells.
-    Exact drop-in replacement for torch.nn.LSTM(..., batch_first=True).
+    Multi-layer Hardware-Efficient LSTM using CoRN-LN + HardSigmoid* + HardTanh.
+    Drop-in replacement for torch.nn.LSTM(..., batch_first=True).
     """
-    def __init__(self, input_size, hidden_size, num_layers=1, batch_first=True, dropout=0.0):
+    def __init__(self, input_size, hidden_size, num_layers=1, batch_first=True, dropout=0.0, act_mode="hard", use_norm=True, quantize=False):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -140,7 +244,13 @@ class HardwareEfficientLSTM(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
         self.cells = nn.ModuleList([
-            CoRN_LSTMCell(input_size if l == 0 else hidden_size, hidden_size)
+            CoRN_LSTMCell(
+                input_size if l == 0 else hidden_size,
+                hidden_size,
+                act_mode=act_mode,
+                use_norm=use_norm,
+                quantize=quantize
+            )
             for l in range(num_layers)
         ])
 
@@ -177,10 +287,10 @@ class HardwareEfficientLSTM(nn.Module):
 
 class LSTMModel(nn.Module):
     """
-    LSTM Model with guaranteed normalization for edge deployment.
-    Default: Hardware-Efficient Reciprocal-Newton Layer-Normalized LSTM (CoRN-LN).
+    LSTM Model with guaranteed normalization and zero-DSP activation options for edge deployment.
+    Default: Hardware-Efficient Reciprocal-Newton Layer-Normalized LSTM (CoRN-LN) + HardSigmoid* + HardTanh.
     """
-    def __init__(self, args, num_classes, device=None, use_corn_ln=True):
+    def __init__(self, args, num_classes, device=None, use_corn_ln=True, act_mode="hard", quantize=False):
         super(LSTMModel, self).__init__()
 
         num_nodes = args.num_nodes
@@ -196,17 +306,21 @@ class LSTMModel(nn.Module):
         self._num_classes = num_classes
         self._device = device
         self._use_corn_ln = use_corn_ln
+        self._act_mode = act_mode
 
         total_input_size = input_dim * num_nodes
-        if use_corn_ln:
+        if use_corn_ln or act_mode == "hard":
             self.lstm = HardwareEfficientLSTM(
                 input_size=total_input_size,
                 hidden_size=rnn_units,
                 num_layers=num_rnn_layers,
                 batch_first=True,
-                dropout=dropout
+                dropout=dropout,
+                act_mode=act_mode,
+                use_norm=use_corn_ln,
+                quantize=quantize
             )
-            self.out_norm = CoRNLayerNorm(rnn_units)
+            self.out_norm = CoRNLayerNorm(rnn_units) if use_corn_ln else nn.Identity()
         else:
             self.lstm = nn.LSTM(
                 total_input_size,
@@ -238,7 +352,6 @@ class LSTMModel(nn.Module):
         if self._device is not None:
             last_out = last_out.to(self._device)
 
-        # Output normalization with guaranteed unit-variance
         normed = self.out_norm(last_out)
         logits = self.fc(self.relu(self.dropout(normed)))
 

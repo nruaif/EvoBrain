@@ -831,6 +831,12 @@ def sequentialize(
     elif name == "lstm[]":
         #
         return torch.nn.LSTMCell(feat_input_size, feat_target_size)
+    elif name in ["corn_lstm", "hardware_lstm"]:
+        from model.lstm import HardwareEfficientLSTM
+        return HardwareEfficientLSTM(feat_input_size, feat_target_size, batch_first=False)
+    elif name in ["corn_lstm[]", "hardware_lstm[]"]:
+        from model.lstm import CoRN_LSTMCell
+        return CoRN_LSTMCell(feat_input_size, feat_target_size)
     elif name == "mha":
         #
         return MultiheadAttention(feat_input_size,feat_target_size)
